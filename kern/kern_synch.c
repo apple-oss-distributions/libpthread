@@ -68,7 +68,6 @@
 #include <kern/zalloc.h>
 #include <kern/sched_prim.h>
 #include <kern/processor.h>
-#include <kern/wait_queue.h>
 //#include <kern/mach_param.h>
 #include <mach/mach_vm.h>
 #include <mach/mach_param.h>
@@ -558,12 +557,12 @@ static void ksyn_mtx_update_owner_qos_override(ksyn_wait_queue_t kwq, uint64_t t
 		if (tid != 0) {
 			if ((tid == kwq->kw_owner) && (kwq->kw_kflags & KSYN_KWF_QOS_APPLIED)) {
 				// hint continues to be accurate, and a boost was already applied
-				pthread_kern->proc_usynch_thread_qos_add_override(NULL, tid, kwq->kw_qos_override, FALSE);
+				pthread_kern->proc_usynch_thread_qos_add_override_for_resource(current_task(), NULL, tid, kwq->kw_qos_override, FALSE, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 			} else {
 				// either hint did not match previous owner, or hint was accurate but mutex was not contended enough for a boost previously
 				boolean_t boostsucceded;
 				
-				boostsucceded = pthread_kern->proc_usynch_thread_qos_add_override(NULL, tid, kwq->kw_qos_override, TRUE);
+				boostsucceded = pthread_kern->proc_usynch_thread_qos_add_override_for_resource(current_task(), NULL, tid, kwq->kw_qos_override, TRUE, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 				
 				if (boostsucceded) {
 					kwq->kw_kflags |= KSYN_KWF_QOS_APPLIED;
@@ -572,7 +571,7 @@ static void ksyn_mtx_update_owner_qos_override(ksyn_wait_queue_t kwq, uint64_t t
 				if (wasboosted && (tid != kwq->kw_owner) && (kwq->kw_owner != 0)) {
 					// the hint did not match the previous owner, so drop overrides
 					PTHREAD_TRACE(TRACE_psynch_ksyn_incorrect_owner, kwq->kw_owner, 0, 0, 0, 0);
-					pthread_kern->proc_usynch_thread_qos_remove_override(NULL, kwq->kw_owner);
+					pthread_kern->proc_usynch_thread_qos_remove_override_for_resource(current_task(), NULL, kwq->kw_owner, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 				}
 			}
 		} else {
@@ -583,7 +582,7 @@ static void ksyn_mtx_update_owner_qos_override(ksyn_wait_queue_t kwq, uint64_t t
 			if (wasboosted && (kwq->kw_owner != 0)) {
 				// the hint did not match the previous owner, so drop overrides
 				PTHREAD_TRACE(TRACE_psynch_ksyn_incorrect_owner, kwq->kw_owner, 0, 0, 0, 0);
-				pthread_kern->proc_usynch_thread_qos_remove_override(NULL, kwq->kw_owner);
+				pthread_kern->proc_usynch_thread_qos_remove_override_for_resource(current_task(), NULL, kwq->kw_owner, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 			}
 		}
 	}
@@ -598,7 +597,7 @@ static void ksyn_mtx_transfer_qos_override(ksyn_wait_queue_t kwq, ksyn_waitq_ele
 			boolean_t boostsucceeded;
 			
 			// More than one waiter, so resource will still be contended after handing off ownership
-			boostsucceeded = pthread_kern->proc_usynch_thread_qos_add_override(kwe->kwe_uth, 0, kwq->kw_qos_override, TRUE);
+			boostsucceeded = pthread_kern->proc_usynch_thread_qos_add_override_for_resource(current_task(), kwe->kwe_uth, 0, kwq->kw_qos_override, TRUE, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 			
 			if (boostsucceeded) {
 				kwq->kw_kflags |= KSYN_KWF_QOS_APPLIED;
@@ -616,9 +615,9 @@ static void ksyn_mtx_transfer_qos_override(ksyn_wait_queue_t kwq, ksyn_waitq_ele
 				PTHREAD_TRACE(TRACE_psynch_ksyn_incorrect_owner, 0, 0, 0, 0, 0);
 			} else if (thread_tid(current_thread()) != kwq->kw_owner) {
 				PTHREAD_TRACE(TRACE_psynch_ksyn_incorrect_owner, kwq->kw_owner, 0, 0, 0, 0);
-				pthread_kern->proc_usynch_thread_qos_remove_override(NULL, kwq->kw_owner);
+				pthread_kern->proc_usynch_thread_qos_remove_override_for_resource(current_task(), NULL, kwq->kw_owner, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 			} else {
-				pthread_kern->proc_usynch_thread_qos_remove_override(current_uthread(), 0);
+				pthread_kern->proc_usynch_thread_qos_remove_override_for_resource(current_task(), current_uthread(), 0, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 			}
 		}
 	}
@@ -640,9 +639,9 @@ static void ksyn_mtx_drop_qos_override(ksyn_wait_queue_t kwq)
 				PTHREAD_TRACE(TRACE_psynch_ksyn_incorrect_owner, 0, 0, 0, 0, 0);
 			} else if (thread_tid(current_thread()) != kwq->kw_owner) {
 				PTHREAD_TRACE(TRACE_psynch_ksyn_incorrect_owner, kwq->kw_owner, 0, 0, 0, 0);
-				pthread_kern->proc_usynch_thread_qos_remove_override(NULL, kwq->kw_owner);
+				pthread_kern->proc_usynch_thread_qos_remove_override_for_resource(current_task(), NULL, kwq->kw_owner, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 			} else {
-				pthread_kern->proc_usynch_thread_qos_remove_override(current_uthread(), 0);
+				pthread_kern->proc_usynch_thread_qos_remove_override_for_resource(current_task(), current_uthread(), 0, kwq->kw_addr, THREAD_QOS_OVERRIDE_TYPE_PTHREAD_MUTEX);
 			}
 		}
 	}
@@ -1609,6 +1608,7 @@ ksyn_wqfind(user_addr_t uaddr, uint32_t mgen, uint32_t ugen, uint32_t sgen, int 
 		pthread_list_lock();
 		res = ksyn_wq_hash_lookup(uaddr, current_proc(), flags, &kwq, &hashptr, &object, &offset);
 		if (res != 0) {
+			pthread_list_unlock();
 			break;
 		}
 		if (kwq == NULL && nkwq == NULL) {
@@ -1679,9 +1679,9 @@ ksyn_wqfind(user_addr_t uaddr, uint32_t mgen, uint32_t ugen, uint32_t sgen, int 
 				kwq->kw_dropcount++;
 			}
 		}
+		pthread_list_unlock();
 		break;
 	}
-	pthread_list_unlock();
 	if (kwqp != NULL) {
 		*kwqp = kwq;
 	}

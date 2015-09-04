@@ -50,6 +50,7 @@
 #define PTHREAD_FEATURE_BSDTHREADCTL	0x04		/* is the bsdthread_ctl syscall available */
 #define PTHREAD_FEATURE_SETSELF			0x08		/* is the BSDTHREAD_CTL_SET_SELF command of bsdthread_ctl available */
 #define PTHREAD_FEATURE_QOS_MAINTENANCE	0x10		/* is QOS_CLASS_MAINTENANCE available */
+#define PTHREAD_FEATURE_KEVENT          0x20		/* supports direct kevent delivery */
 #define PTHREAD_FEATURE_QOS_DEFAULT		0x40000000	/* the kernel supports QOS_CLASS_DEFAULT */
 
 /* pthread bsdthread_ctl sysctl commands */
@@ -60,6 +61,8 @@
 #define BSDTHREAD_CTL_SET_SELF	0x100	/* bsdthread_ctl(BSDTHREAD_CTL_SET_SELF, priority, voucher, flags) */
 #define BSDTHREAD_CTL_QOS_OVERRIDE_RESET	0x200	/* bsdthread_ctl(BSDTHREAD_CTL_QOS_OVERRIDE_RESET, 0, 0, 0) */
 #define BSDTHREAD_CTL_QOS_OVERRIDE_DISPATCH	0x400	/* bsdthread_ctl(BSDTHREAD_CTL_QOS_OVERRIDE_DISPATCH, thread_port, priority, 0) */
+#define BSDTHREAD_CTL_QOS_DISPATCH_ASYNCHRONOUS_OVERRIDE_ADD	0x401	/* bsdthread_ctl(BSDTHREAD_CTL_QOS_DISPATCH_ASYNCHRONOUS_OVERRIDE_ADD, thread_port, priority, resource) */
+#define BSDTHREAD_CTL_QOS_DISPATCH_ASYNCHRONOUS_OVERRIDE_RESET	0x402	/* bsdthread_ctl(BSDTHREAD_CTL_QOS_DISPATCH_ASYNCHRONOUS_OVERRIDE_RESET, 0|1 (?reset_all), resource, 0) */
 
 /* qos_class_t is mapped into one of these bits in the bitfield, this mapping now exists here because
  * libdispatch requires the QoS class mask of the pthread_priority_t to be a bitfield.
@@ -220,7 +223,8 @@ struct _pthread_registration_data {
 	PTHREAD_FEATURE_BSDTHREADCTL | \
 	PTHREAD_FEATURE_SETSELF | \
 	PTHREAD_FEATURE_QOS_MAINTENANCE | \
-	PTHREAD_FEATURE_QOS_DEFAULT)
+	PTHREAD_FEATURE_QOS_DEFAULT | \
+	PTHREAD_FEATURE_KEVENT )
 
 extern pthread_callbacks_t pthread_kern;
 
@@ -236,10 +240,11 @@ struct ksyn_waitq_element {
 };
 typedef struct ksyn_waitq_element * ksyn_waitq_element_t;
 
-pthread_priority_t pthread_qos_class_get_priority(int qos);
-int pthread_priority_get_qos_class(pthread_priority_t priority);
-int pthread_priority_get_class_index(pthread_priority_t priority);
-pthread_priority_t pthread_priority_from_class_index(int index);
+pthread_priority_t pthread_qos_class_get_priority(int qos) __attribute__((const));
+int pthread_priority_get_qos_class(pthread_priority_t priority) __attribute__((const));
+int pthread_priority_get_class_index(pthread_priority_t priority) __attribute__((const));
+int qos_get_class_index(int qos) __attribute__((const));
+pthread_priority_t pthread_priority_from_class_index(int index) __attribute__((const));
 
 #define PTH_DEFAULT_STACKSIZE 512*1024
 #define MAX_PTHREAD_SIZE 64*1024
@@ -269,10 +274,12 @@ int _bsdthread_register(struct proc *p, user_addr_t threadstart, user_addr_t wqt
 int _bsdthread_terminate(struct proc *p, user_addr_t stackaddr, size_t size, uint32_t kthport, uint32_t sem, int32_t *retval);
 int _bsdthread_ctl_set_qos(struct proc *p, user_addr_t cmd, mach_port_name_t kport, user_addr_t tsd_priority_addr, user_addr_t arg3, int *retval);
 int _bsdthread_ctl_set_self(struct proc *p, user_addr_t cmd, pthread_priority_t priority, mach_port_name_t voucher, _pthread_set_flags_t flags, int *retval);
-int _bsdthread_ctl_qos_override_start(struct proc *p, user_addr_t cmd, mach_port_name_t kport, pthread_priority_t priority, user_addr_t arg3, int *retval);
-int _bsdthread_ctl_qos_override_end(struct proc *p, user_addr_t cmd, mach_port_name_t kport, user_addr_t arg2, user_addr_t arg3, int *retval);
+int _bsdthread_ctl_qos_override_start(struct proc *p, user_addr_t cmd, mach_port_name_t kport, pthread_priority_t priority, user_addr_t resource, int *retval);
+int _bsdthread_ctl_qos_override_end(struct proc *p, user_addr_t cmd, mach_port_name_t kport, user_addr_t resource, user_addr_t arg3, int *retval);
 int _bsdthread_ctl_qos_override_dispatch(struct proc __unused *p, user_addr_t __unused cmd, mach_port_name_t kport, pthread_priority_t priority, user_addr_t arg3, int __unused *retval);
 int _bsdthread_ctl_qos_override_reset(struct proc __unused *p, user_addr_t __unused cmd, user_addr_t arg1, user_addr_t arg2, user_addr_t arg3, int __unused *retval);
+int _bsdthread_ctl_qos_dispatch_asynchronous_override_add(struct proc __unused *p, user_addr_t __unused cmd, mach_port_name_t kport, pthread_priority_t priority, user_addr_t resource, int __unused *retval);
+int _bsdthread_ctl_qos_dispatch_asynchronous_override_reset(struct proc __unused *p, user_addr_t __unused cmd, int reset_all, user_addr_t resource, user_addr_t arg3, int __unused *retval);
 int _bsdthread_ctl(struct proc *p, user_addr_t cmd, user_addr_t arg1, user_addr_t arg2, user_addr_t arg3, int *retval);
 int _thread_selfid(__unused struct proc *p, uint64_t *retval);
 int _workq_kernreturn(struct proc *p, int options, user_addr_t item, int arg2, int arg3, int32_t *retval);
@@ -297,6 +304,16 @@ extern lck_mtx_t *pthread_list_mlock;
 extern thread_call_t psynch_thcall;
 
 struct uthread* current_uthread(void);
+
+// Call for the kernel's kevent system to request threads.  A list of QoS/event
+// counts should be provided, sorted by flags and then QoS class.  If the
+// identity of the thread to handle the request is known, it will be returned.
+// If a new thread must be created, NULL will be returned.
+thread_t _workq_reqthreads(struct proc *p, int requests_count,
+						   workq_reqthreads_req_t requests);
+
+// Resolve a pthread_priority_t to a QoS/relative pri
+integer_t _thread_qos_from_pthread_priority(unsigned long pri, unsigned long *flags);
 
 #endif // KERNEL
 
