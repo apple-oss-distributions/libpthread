@@ -23,20 +23,38 @@
 
 #include "internal.h"
 
-#include <_simple.h>
 #include <mach/mach_vm.h>
 #include <unistd.h>
 #include <spawn.h>
 #include <spawn_private.h>
+#include <pthread/spawn.h>
 #include <sys/spawn_internal.h>
 #include <sys/ulock.h>
 
-// TODO: remove me when internal.h can include *_private.h itself
-#include "workqueue_private.h"
-#include "qos_private.h"
-
 #define PTHREAD_OVERRIDE_SIGNATURE	(0x6f766572)
 #define PTHREAD_OVERRIDE_SIG_DEAD	(0x7265766f)
+
+#if !defined(VARIANT_STATIC)
+// internally redirected upcalls in case qos overrides are used
+// before __pthread_init has run
+PTHREAD_NOEXPORT void *
+malloc(size_t sz)
+{
+	if (os_likely(_pthread_malloc)) {
+		return _pthread_malloc(sz);
+	} else {
+		return NULL;
+	}
+}
+
+PTHREAD_NOEXPORT void
+free(void *p)
+{
+	if (os_likely(_pthread_free)) {
+		_pthread_free(p);
+	}
+}
+#endif // VARIANT_STATIC
 
 struct pthread_override_s
 {
@@ -146,13 +164,14 @@ pthread_set_qos_class_np(pthread_t thread, qos_class_t qc, int relpri)
 		 */
 		return EPERM;
 	}
+	_pthread_validate_signature(thread);
 	return pthread_set_qos_class_self_np(qc, relpri);
 }
 
 int
 pthread_get_qos_class_np(pthread_t thread, qos_class_t *qc, int *relpri)
 {
-	pthread_priority_t pp = thread->tsd[_PTHREAD_TSD_SLOT_PTHREAD_QOS_CLASS];
+	pthread_priority_t pp = _pthread_tsd_slot(thread, PTHREAD_QOS_CLASS);
 	_pthread_priority_split(pp, qc, relpri);
 	return 0;
 }
@@ -208,7 +227,8 @@ _pthread_qos_class_encode_workqueue(int queue_priority, unsigned long flags)
 
 #define _PTHREAD_SET_SELF_OUTSIDE_QOS_SKIP \
 		(_PTHREAD_SET_SELF_QOS_FLAG | _PTHREAD_SET_SELF_FIXEDPRIORITY_FLAG | \
-		 _PTHREAD_SET_SELF_TIMESHARE_FLAG)
+		 _PTHREAD_SET_SELF_TIMESHARE_FLAG | \
+		 _PTHREAD_SET_SELF_ALTERNATE_AMX)
 
 int
 _pthread_set_properties_self(_pthread_set_flags_t flags,
@@ -217,6 +237,8 @@ _pthread_set_properties_self(_pthread_set_flags_t flags,
 	pthread_t self = pthread_self();
 	_pthread_set_flags_t kflags = flags;
 	int rv = 0;
+
+	_pthread_validate_signature(self);
 
 	if (self->wq_outsideqos && (flags & _PTHREAD_SET_SELF_OUTSIDE_QOS_SKIP)) {
 		// A number of properties cannot be altered if we are a workloop
@@ -255,6 +277,13 @@ pthread_set_timeshare_self(void)
 {
 	return _pthread_set_properties_self(_PTHREAD_SET_SELF_TIMESHARE_FLAG, 0, 0);
 }
+
+int
+pthread_prefer_alternate_amx_self(void)
+{
+	return _pthread_set_properties_self(_PTHREAD_SET_SELF_ALTERNATE_AMX, 0, 0);
+}
+
 
 pthread_override_t
 pthread_override_qos_class_start_np(pthread_t thread,  qos_class_t qc, int relpri)
@@ -542,14 +571,14 @@ int
 posix_spawnattr_set_qos_class_np(posix_spawnattr_t * __restrict __attr, qos_class_t __qos_class)
 {
 	switch (__qos_class) {
-		case QOS_CLASS_UTILITY:
-			return posix_spawnattr_set_qos_clamp_np(__attr, POSIX_SPAWN_PROC_CLAMP_UTILITY);
-		case QOS_CLASS_BACKGROUND:
-			return posix_spawnattr_set_qos_clamp_np(__attr, POSIX_SPAWN_PROC_CLAMP_BACKGROUND);
-		case QOS_CLASS_MAINTENANCE:
-			return posix_spawnattr_set_qos_clamp_np(__attr, POSIX_SPAWN_PROC_CLAMP_MAINTENANCE);
-		default:
-			return EINVAL;
+	case QOS_CLASS_UTILITY:
+		return posix_spawnattr_set_qos_clamp_np(__attr, POSIX_SPAWN_PROC_CLAMP_UTILITY);
+	case QOS_CLASS_BACKGROUND:
+		return posix_spawnattr_set_qos_clamp_np(__attr, POSIX_SPAWN_PROC_CLAMP_BACKGROUND);
+	case QOS_CLASS_MAINTENANCE:
+		return posix_spawnattr_set_qos_clamp_np(__attr, POSIX_SPAWN_PROC_CLAMP_MAINTENANCE);
+	default:
+		return EINVAL;
 	}
 }
 
@@ -568,18 +597,18 @@ posix_spawnattr_get_qos_class_np(const posix_spawnattr_t *__restrict __attr, qos
 	}
 
 	switch (clamp) {
-		case POSIX_SPAWN_PROC_CLAMP_UTILITY:
-			*__qos_class = QOS_CLASS_UTILITY;
-			break;
-		case POSIX_SPAWN_PROC_CLAMP_BACKGROUND:
-			*__qos_class = QOS_CLASS_BACKGROUND;
-			break;
-		case POSIX_SPAWN_PROC_CLAMP_MAINTENANCE:
-			*__qos_class = QOS_CLASS_MAINTENANCE;
-			break;
-		default:
-			*__qos_class = QOS_CLASS_UNSPECIFIED;
-			break;
+	case POSIX_SPAWN_PROC_CLAMP_UTILITY:
+		*__qos_class = QOS_CLASS_UTILITY;
+		break;
+	case POSIX_SPAWN_PROC_CLAMP_BACKGROUND:
+		*__qos_class = QOS_CLASS_BACKGROUND;
+		break;
+	case POSIX_SPAWN_PROC_CLAMP_MAINTENANCE:
+		*__qos_class = QOS_CLASS_MAINTENANCE;
+		break;
+	default:
+		*__qos_class = QOS_CLASS_UNSPECIFIED;
+		break;
 	}
 
 	return 0;
