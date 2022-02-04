@@ -58,6 +58,7 @@
 #include <mach/mach_init.h>
 #include <mach/mach_vm.h>
 #include <mach/mach_sync_ipc.h>
+#include <mach/thread_switch.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -72,6 +73,12 @@
 #endif // __has_include(<ptrauth.h>)
 #include <os/thread_self_restrict.h>
 #include <os/tsd.h>
+
+#if _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+#include <mach-o/dyld_priv.h>
+#include <mach-o/loader.h>
+#include <mach-o/getsect.h>
+#endif // _PTHREAD_CONFIG_JIT_WRITE_PROTECT
 
 // Default stack size is 512KB; independent of the main thread's stack size.
 #define DEFAULT_STACK_SIZE (size_t)(512 * 1024)
@@ -162,6 +169,9 @@ static int pthread_concurrency;
 uintptr_t _pthread_ptr_munge_token;
 
 static void (*exitf)(int) = __exit;
+
+// workgroup support
+static struct pthread_workgroup_functions_s *_pthread_workgroup_functions;
 
 // work queue support data
 OS_NORETURN OS_COLD
@@ -1152,24 +1162,212 @@ pthread_setname_np(const char *name)
 
 }
 
+#if TARGET_OS_OSX
+
+#if _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+
+#if !__LP64__
+#error _PTHREAD_CONFIG_JIT_WRITE_PROTECT should imply __LP64__
+#endif // !__LP64__
+
+static union _pthread_jit_config_u {
+	struct {
+		bool allowlist_enabled;
+		bool allowlist_frozen;
+		uint32_t allowlist_count;
+		pthread_jit_write_callback_t allowlist[];
+	};
+	uint8_t page[PAGE_MAX_SIZE];
+} _pthread_jit_config OS_ALIGNED(PAGE_MAX_SIZE);
+
+_Static_assert(sizeof(_pthread_jit_config) == PAGE_MAX_SIZE,
+		"_pthread_jit_config size must be PAGE_MAX_SIZE");
+
+#define _PTHREAD_JIT_ALLOWLIST_CAPACITY \
+		((PAGE_MAX_SIZE - offsetof(union _pthread_jit_config_u, allowlist)) / \
+		sizeof(pthread_jit_write_callback_t))
+
+static void
+_pthread_jit_write_protect_global_init(void)
+{
+	bool allowlist_feature_enabled =
+			(__pthread_supported_features & PTHREAD_FEATURE_JIT_ALLOWLIST);
+	if (os_thread_self_restrict_rwx_is_supported() &&
+			allowlist_feature_enabled) {
+		union _pthread_jit_config_u *config = &_pthread_jit_config;
+
+		uintptr_t alignment = ((uintptr_t)config) % PAGE_MAX_SIZE;
+		if (alignment != 0) {
+			PTHREAD_INTERNAL_CRASH(alignment, "jit config invalid alignment");
+		}
+
+		// Remap the config page as permanent.  Note that this discards any
+		// previous content, so all changes to the config must come _after_ this
+		// point.
+		//
+		// TODO: find a suitable tag for this memory (rdar://75202626)
+		mach_vm_address_t allocaddr = (mach_vm_address_t)config;
+		kern_return_t kr = mach_vm_map(mach_task_self(), &allocaddr,
+				sizeof(*config), PAGE_MAX_SIZE - 1,
+				VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE | VM_FLAGS_PERMANENT,
+				MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT,
+				VM_INHERIT_DEFAULT);
+		if (kr != KERN_SUCCESS || allocaddr != (mach_vm_address_t)config) {
+			PTHREAD_INTERNAL_CRASH(kr, "jit config vm_map PERMANENT failed");
+		}
+
+		config->allowlist_enabled = true;
+	}
+}
+
+static void
+_pthread_jit_write_protect_bulk_image_load_callback(unsigned int image_count,
+		const struct mach_header *mhs[], __unused const char *paths[])
+{
+	union _pthread_jit_config_u *config = &_pthread_jit_config;
+
+	// Ignore dlopen()s
+	if (config->allowlist_frozen) {
+		return;
+	}
+
+	for (unsigned int i = 0; i < image_count; i++) {
+		const struct mach_header_64 *mh = (const struct mach_header_64 *)mhs[i];
+
+		if (mh->flags & MH_DYLIB_IN_CACHE) {
+			// Internal code should use os_thread_self_restrict_rwx*()
+			continue;
+		}
+
+		unsigned long size = 0;
+		uint8_t *data = getsectiondata(mh, "__DATA_CONST", "__pth_jit_func",
+				&size);
+		if (!data || !size ||
+				(size % sizeof(pthread_jit_write_callback_t) != 0)) {
+			continue;
+		}
+
+		const pthread_jit_write_callback_t *image_allowlist =
+				(const pthread_jit_write_callback_t *)data;
+		size_t image_allowlist_count = size / sizeof(image_allowlist[0]);
+
+		// Copy allowed function pointers from the section up to the
+		// NULL-terminator
+		for (size_t j = 0; j < image_allowlist_count && image_allowlist[j]; j++) {
+			if (config->allowlist_count >= _PTHREAD_JIT_ALLOWLIST_CAPACITY) {
+				PTHREAD_CLIENT_CRASH(config->allowlist_count,
+						"Too many pthread jit write callbacks");
+			}
+
+			config->allowlist[config->allowlist_count] = image_allowlist[j];
+			config->allowlist_count++;
+		}
+	}
+}
+
+static void
+_pthread_jit_write_protect_late_init(void)
+{
+	union _pthread_jit_config_u *config = &_pthread_jit_config;
+	if (config->allowlist_enabled) {
+		// Iterate all initial images for allowed functions
+		_dyld_register_for_bulk_image_loads(
+				_pthread_jit_write_protect_bulk_image_load_callback);
+
+		// Since there's no way to un-register the image load callback, just
+		// remember that we're no longer interested in new images
+		config->allowlist_frozen = true;
+
+		// By protecting config read-only with set_maximum, prevent an attack
+		// from later altering its protection back to writeable.
+		kern_return_t kr = mach_vm_protect(mach_task_self(),
+				(mach_vm_address_t)config, sizeof(*config),
+				/* set_maximum */ true, VM_PROT_READ);
+		if (kr != KERN_SUCCESS) {
+			PTHREAD_INTERNAL_CRASH(kr, "jit config vm_protect() failed");
+		}
+	}
+}
+
+#endif // _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+
+
 void
 pthread_jit_write_protect_np(int enable)
 {
-        if (!os_thread_self_restrict_rwx_is_supported()) {
-                return;
-        }
+	if (!os_thread_self_restrict_rwx_is_supported()) {
+		return;
+	}
 
-        if (enable) {
-                os_thread_self_restrict_rwx_to_rx();
-        } else {
-                os_thread_self_restrict_rwx_to_rw();
-        }
+	if (enable) {
+		os_thread_self_restrict_rwx_to_rx();
+	} else {
+		os_thread_self_restrict_rwx_to_rw();
+	}
+
+#if _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+	// Validate _after_ toggling.
+	union _pthread_jit_config_u *config = &_pthread_jit_config;
+	if (config->allowlist_enabled) {
+		if (!enable) {
+			os_thread_self_restrict_rwx_to_rx();
+		}
+
+		PTHREAD_CLIENT_CRASH(0,
+				"pthread_jit_write_protect_np() disallowed by allowlist");
+	}
+#endif // _PTHREAD_CONFIG_JIT_WRITE_PROTECT
 }
 
-int pthread_jit_write_protect_supported_np()
+int
+pthread_jit_write_protect_supported_np()
 {
-       return os_thread_self_restrict_rwx_is_supported();
+	return os_thread_self_restrict_rwx_is_supported();
 }
+
+int
+pthread_jit_write_with_callback_np(pthread_jit_write_callback_t callback,
+		void *ctx)
+{
+#if _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+	if (!os_thread_self_restrict_rwx_is_supported()) {
+		return callback(ctx);
+	}
+
+	// The toggle to RW must come before validation.  If we validate before
+	// toggling, an attack might try to jump into the middle of the body after
+	// the validation.
+	os_thread_self_restrict_rwx_to_rw();
+
+	union _pthread_jit_config_u *config = &_pthread_jit_config;
+	if (config->allowlist_enabled) {
+		uint32_t i;
+		for (i = 0; i < config->allowlist_count; i++) {
+			if (config->allowlist[i] == callback) {
+				break;
+			}
+		}
+
+		if (i == config->allowlist_count) {
+			// Just to be safe, toggle back to RX before bailing out
+			os_thread_self_restrict_rwx_to_rx();
+
+			PTHREAD_CLIENT_CRASH((uintptr_t)callback,
+					"pthread_jit_write_with_callback_np() callback not in allowlist");
+		}
+	}
+
+	int rv = callback(ctx);
+
+	os_thread_self_restrict_rwx_to_rx();
+
+	return rv;
+#else // _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+	return callback(ctx);
+#endif // _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+}
+
+#endif // TARGET_OS_OSX
 
 OS_ALWAYS_INLINE
 static inline void
@@ -1305,6 +1503,30 @@ pthread_create_suspended_np(pthread_t *thread, const pthread_attr_t *attr,
 {
 	unsigned int flags = _PTHREAD_CREATE_SUSPENDED;
 	return _pthread_create(thread, attr, start_routine, arg, flags);
+}
+
+void
+pthread_install_workgroup_functions_np(
+		const struct pthread_workgroup_functions_s *pwgf)
+{
+	if (_pthread_workgroup_functions) {
+		PTHREAD_CLIENT_CRASH((uintptr_t)_pthread_workgroup_functions,
+				"workgroup functions already installed");
+	}
+
+	_pthread_workgroup_functions = pwgf;
+}
+
+int
+pthread_create_with_workgroup_np(pthread_t *thread, os_workgroup_t wg,
+		const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
+{
+	if (!_pthread_workgroup_functions) {
+		PTHREAD_CLIENT_CRASH(0, "workgroup functions not yet installed");
+	}
+
+	return _pthread_workgroup_functions->pwgf_create_with_workgroup(thread, wg,
+			attr, start_routine, arg);
 }
 
 int
@@ -1728,6 +1950,17 @@ parse_ptr_munge_params(const char *envp[], const char *apple[])
 	_pthread_init_signature(_main_thread_ptr);
 }
 
+static void
+parse_main_thread_port(const char *apple[], mach_port_name_t *main_th)
+{
+       const char *p, *s;
+       p = _simple_getenv(apple, "th_port");
+       if (p) {
+               *main_th = (mach_port_name_t)_pthread_strtoul(p, &s, 16);
+               bzero((char *)p, strlen(p));
+       }
+}
+
 int
 __pthread_init(const struct _libpthread_functions *pthread_funcs,
 		const char *envp[], const char *apple[],
@@ -1808,13 +2041,17 @@ __pthread_init(const struct _libpthread_functions *pthread_funcs,
 			stackaddr, stacksize, allocaddr, allocsize);
 	thread->tl_joinable = true;
 
+	// Get main thread port name from the kernel.
+	mach_port_name_t main_th_port = MACH_PORT_NULL;
+	parse_main_thread_port(apple, &main_th_port);
+
 	// Finish initialization with common code that is reinvoked on the
 	// child side of a fork.
 
 	// Finishes initialization of main thread attributes.
 	// Initializes the thread list and add the main thread.
 	// Calls _pthread_set_self() to prepare the main thread for execution.
-	_pthread_main_thread_init(thread);
+	_pthread_main_thread_init(thread, main_th_port);
 
 	struct _pthread_registration_data registration_data;
 	// Set up kernel entry points with __bsdthread_register.
@@ -1823,6 +2060,9 @@ __pthread_init(const struct _libpthread_functions *pthread_funcs,
 	// Have pthread_key and pthread_mutex do their init envvar checks.
 	_pthread_key_global_init(envp);
 	_pthread_mutex_global_init(envp, &registration_data);
+#if _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+	_pthread_jit_write_protect_global_init();
+#endif
 
 #if PTHREAD_DEBUG_LOG
 	_SIMPLE_STRING path = _simple_salloc();
@@ -1835,10 +2075,22 @@ __pthread_init(const struct _libpthread_functions *pthread_funcs,
 
 	return 0;
 }
+
+// NOTE: all releases aligned with macOS 11.4 export __pthread_late_init(), but
+// it is only currently called on TARGET_OS_OSX.
+void
+__pthread_late_init(const char *envp[], const char *apple[],
+		const struct ProgramVars *vars)
+{
+#if _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+	_pthread_jit_write_protect_late_init();
+#endif // _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+}
+
 #endif // !VARIANT_DYLD
 
 void
-_pthread_main_thread_init(pthread_t p)
+_pthread_main_thread_init(pthread_t p, mach_port_name_t main_thread_port)
 {
 	TAILQ_INIT(&__pthread_head);
 	_pthread_lock_init(&_pthread_list_lock);
@@ -1846,7 +2098,13 @@ _pthread_main_thread_init(pthread_t p)
 	p->__cleanup_stack = NULL;
 	p->tl_join_ctx = NULL;
 	p->tl_exit_gate = MACH_PORT_NULL;
-	_pthread_tsd_slot(p, MACH_THREAD_SELF) = mach_thread_self();
+
+	if (main_thread_port != MACH_PORT_NULL) {
+		_pthread_tsd_slot(p, MACH_THREAD_SELF) = main_thread_port;
+	} else {
+		// Can't get thread port from kernel or we are forking, fallback to mach_thread_self
+		_pthread_tsd_slot(p, MACH_THREAD_SELF) = mach_thread_self();
+	}
 	_pthread_tsd_slot(p, MIG_REPLY) = mach_reply_port();
 	_pthread_tsd_slot(p, MACH_SPECIAL_REPLY) = MACH_PORT_NULL;
 	_pthread_tsd_slot(p, SEMAPHORE_CACHE) = SEMAPHORE_NULL;
@@ -1861,7 +2119,7 @@ _pthread_main_thread_init(pthread_t p)
 void
 _pthread_main_thread_postfork_init(pthread_t p)
 {
-	_pthread_main_thread_init(p);
+	_pthread_main_thread_init(p, MACH_PORT_NULL);
 	_pthread_set_self_internal(p);
 }
 
@@ -1869,6 +2127,51 @@ int
 sched_yield(void)
 {
 	swtch_pri(0);
+	return 0;
+}
+
+int
+_pthread_yield_to_enqueuer_4dispatch(unsigned long tsd_slot, void *expected_val,
+		unsigned int timeout_ms)
+{
+	mach_port_t enqueuer_port = MACH_PORT_NULL;
+
+	_pthread_lock_lock(&_pthread_list_lock);
+
+	/* If there are multiple enqueuers to the same queue, this logic does not
+	 * protect us from repeatedly yielding to the same thread which may not be
+	 * able to unblock us. But that is only a major problem if that thread is
+	 * constantly enqueueing to the same queue in a loop. We've not encountered
+	 * that scenario enough to handle that here.
+	 */
+	pthread_t p = NULL;
+	TAILQ_FOREACH(p, &__pthread_head, tl_plist) {
+		if (expected_val) {
+			if (p->tsd[tsd_slot] == expected_val) {
+				enqueuer_port = _pthread_tsd_slot(p, MACH_THREAD_SELF);
+				break;
+			}
+		} else {
+			if (p->tsd[tsd_slot] != NULL) {
+				enqueuer_port = _pthread_tsd_slot(p, MACH_THREAD_SELF);
+				break;
+			}
+		}
+	}
+	_pthread_lock_unlock(&_pthread_list_lock);
+
+	/* This will either do a directed yield if we found a potential enqueuer, or
+	 * do a suppress.
+	 *
+	 * Technically this is racey since we are referencing the enqueuer_port
+	 * without taking an additional reference to it under the list_lock. But
+	 * thread_switch falls back to a suppressed yield if the port is not an
+	 * actual valid thread_port anymore so that's a better win for perf rather
+	 * than taking refs
+	 */
+	thread_switch(enqueuer_port, SWITCH_OPTION_OSLOCK_DEPRESS,
+		(mach_msg_timeout_t) timeout_ms);
+
 	return 0;
 }
 
@@ -1944,6 +2247,15 @@ pthread_stack_frame_decode_np(uintptr_t frame_addr, uintptr_t *return_addr)
 {
 	struct frame_data *frame = (struct frame_data *)frame_addr;
 
+#if __has_feature(ptrauth_calls)
+	/* In the case of Swift async backtraces, the context pointer read from
+	 * the OS stack is signed and will be passed here as `frame_addr`.
+	 * There is no harm in generally stripping this pointer which solves
+	 * this usecase.
+	 */
+	frame = ptrauth_strip(frame, ptrauth_key_process_dependent_data);
+#endif
+
 	if (return_addr) {
 #if __has_feature(ptrauth_calls)
 		*return_addr = (uintptr_t)ptrauth_strip((void *)frame->ret_addr,
@@ -1953,11 +2265,25 @@ pthread_stack_frame_decode_np(uintptr_t frame_addr, uintptr_t *return_addr)
 #endif /* __has_feature(ptrauth_calls) */
 	}
 
+	uintptr_t next_frame = frame->frame_addr_next;
 #if __has_feature(ptrauth_calls)
-	return (uintptr_t)ptrauth_strip((void *)frame->frame_addr_next,
+	next_frame = (uintptr_t)ptrauth_strip((void *)next_frame,
 			ptrauth_key_frame_pointer);
 #endif /* __has_feature(ptrauth_calls) */
-	return (uintptr_t)frame->frame_addr_next;
+#if __LP64__
+	/*
+	 * On our 64 bit platforms the top byte of the frame pointer
+	 * in userspace should always be zeros. Some ABIs might use
+	 * this byte to stash extended information about the frame
+	 * (for example the Swift concurrency ABI does this). On arm64
+	 * TBI makes dereferencing it transparent, but people might
+	 * want to do arithmetic on the resulting pointer, so strip
+	 * it unconditionally.
+	 */
+	next_frame = next_frame & ~0xFF00000000000000ul;
+#endif
+
+	return next_frame;
 }
 
 #pragma mark pthread workqueue support routines
@@ -1972,6 +2298,7 @@ _pthread_bsdthread_init(struct _pthread_registration_data *data)
 	data->tsd_offset = offsetof(struct pthread_s, tsd);
 	data->mach_thread_self_offset = __TSD_MACH_THREAD_SELF * sizeof(void *);
 	data->joinable_offset_bits = CHAR_BIT * (offsetof(struct pthread_s, tl_policy) + 1);
+	data->wq_quantum_expiry_offset = __PTK_LIBDISPATCH_KEY10 * sizeof(void *);
 
 	int rv = __bsdthread_register(thread_start, start_wqthread, (int)PTHREAD_SIZE,
 			(void*)data, (uintptr_t)sizeof(*data), data->dispatch_queue_offset);
@@ -2017,17 +2344,17 @@ _pthread_bsdthread_init(struct _pthread_registration_data *data)
 
 OS_NOINLINE
 static void
-_pthread_wqthread_legacy_worker_wrap(pthread_priority_t pp)
+_pthread_wqthread_legacy_worker_wrap(pthread_workqueue_function2_arg_t workq_function2_arg)
 {
 	/* Old thread priorities are inverted from where we have them in
 	 * the new flexible priority scheme. The highest priority is zero,
 	 * up to 2, with background at 3.
 	 */
 	pthread_workqueue_function_t func = (pthread_workqueue_function_t)__libdispatch_workerfunction;
-	bool overcommit = (pp & _PTHREAD_PRIORITY_OVERCOMMIT_FLAG);
+	bool overcommit = (workq_function2_arg & _PTHREAD_PRIORITY_OVERCOMMIT_FLAG);
 	int opts = overcommit ? WORKQ_ADDTHREADS_OPTION_OVERCOMMIT : 0;
 
-	switch (_pthread_priority_thread_qos(pp)) {
+	switch (_pthread_priority_thread_qos(workq_function2_arg)) {
 	case THREAD_QOS_USER_INITIATED:
 		return (*func)(WORKQ_HIGH_PRIOQUEUE, opts, NULL);
 	case THREAD_QOS_LEGACY:
@@ -2043,7 +2370,7 @@ _pthread_wqthread_legacy_worker_wrap(pthread_priority_t pp)
 	case THREAD_QOS_BACKGROUND:
 		return (*func)(WORKQ_BG_PRIOQUEUE, opts, NULL);
 	}
-	PTHREAD_INTERNAL_CRASH(pp, "Invalid pthread priority for the legacy interface");
+	PTHREAD_INTERNAL_CRASH(workq_function2_arg, "Invalid pthread priority for the legacy interface");
 }
 
 OS_ALWAYS_INLINE
@@ -2063,6 +2390,7 @@ _pthread_wqthread_priority(int flags)
 	if (flags & WQ_FLAG_THREAD_OVERCOMMIT) {
 		pp |= _PTHREAD_PRIORITY_OVERCOMMIT_FLAG;
 	}
+
 	if (flags & WQ_FLAG_THREAD_PRIO_QOS) {
 		qos = (thread_qos_t)(flags & WQ_FLAG_THREAD_PRIO_MASK);
 		pp = _pthread_priority_make_from_thread_qos(qos, 0, pp);
@@ -2142,6 +2470,13 @@ _pthread_wqthread(pthread_t self, mach_port_t kport, void *stacklowaddr,
 
 	self->tsd[_PTHREAD_TSD_SLOT_PTHREAD_QOS_CLASS] = (void *)pp;
 
+	// Only used for conveying to libdispatch that the thread is coming out to
+	// handle a cooperative request.
+	pthread_workqueue_function2_arg_t workq_function2_arg = pp;
+	if (flags & WQ_FLAG_THREAD_COOPERATIVE) {
+		workq_function2_arg |= _PTHREAD_PRIORITY_COOPERATIVE_FLAG;
+	}
+
 	// avoid spills on the stack hard to keep used stack space minimal
 	if (os_unlikely(nkevents == WORKQ_EXIT_THREAD_NKEVENT)) {
 		_pthread_wqthread_exit(self);
@@ -2160,12 +2495,12 @@ _pthread_wqthread(pthread_t self, mach_port_t kport, void *stacklowaddr,
 		__workq_kernreturn(WQOPS_THREAD_KEVENT_RETURN, self->arg, self->wq_nevents, 0);
 	} else {
 		self->fun = (void *(*)(void*))__libdispatch_workerfunction;
-		self->arg = (void *)(uintptr_t)pp;
+		self->arg = (void *)(uintptr_t)workq_function2_arg;
 		self->wq_nevents = 0;
 		if (os_likely(__workq_newapi)) {
-			(*__libdispatch_workerfunction)(pp);
+			(*__libdispatch_workerfunction)(workq_function2_arg);
 		} else {
-			_pthread_wqthread_legacy_worker_wrap(pp);
+			_pthread_wqthread_legacy_worker_wrap(workq_function2_arg);
 		}
 		__workq_kernreturn(WQOPS_THREAD_RETURN, NULL, 0, 0);
 	}
@@ -2373,6 +2708,22 @@ _pthread_workqueue_addthreads(int numthreads, pthread_priority_t priority)
 #endif
 
 	res = __workq_kernreturn(WQOPS_QUEUE_REQTHREADS, NULL, numthreads, (int)priority);
+	if (res == -1) {
+		res = errno;
+	}
+	return res;
+}
+
+int
+_pthread_workqueue_add_cooperativethreads(int numthreads, pthread_priority_t priority)
+{
+	int res = 0;
+
+	if (__libdispatch_workerfunction == NULL) {
+		return EPERM;
+	}
+
+	res = __workq_kernreturn(WQOPS_QUEUE_REQTHREADS2, NULL, numthreads, (int)priority);
 	if (res == -1) {
 		res = errno;
 	}

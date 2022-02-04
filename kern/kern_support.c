@@ -269,16 +269,34 @@ _bsdthread_create(struct proc *p,
 	}
 
 	PTHREAD_TRACE(pthread_thread_create | DBG_FUNC_START, flags, 0, 0, 0);
-
-	kret = pthread_kern->thread_create(ctask, &th);
+	
+	/* Create thread and make it immovable, do not pin control port yet */
+	if (pthread_kern->thread_create_immovable) {
+		kret = pthread_kern->thread_create_immovable(ctask, &th);
+	} else {
+		kret = pthread_kern->thread_create(ctask, &th);
+	}
+	
 	if (kret != KERN_SUCCESS)
 		return(ENOMEM);
 	thread_reference(th);
 
 	pthread_kern->thread_set_tag(th, THREAD_TAG_PTHREAD);
 
-	sright = (void *)pthread_kern->convert_thread_to_port(th);
-	th_thport = pthread_kern->ipc_port_copyout_send(sright, pthread_kern->task_get_ipcspace(ctask));
+	if (pthread_kern->convert_thread_to_port_pinned) {
+		/* Convert to immovable/pinned thread port, but port is not pinned yet */
+		sright = (void *)pthread_kern->convert_thread_to_port_pinned(th);
+	} else {
+		sright = (void *)pthread_kern->convert_thread_to_port(th);
+	}
+	
+	if (pthread_kern->ipc_port_copyout_send_pinned) {
+		/* Atomically, pin and copy out the port */
+		th_thport = pthread_kern->ipc_port_copyout_send_pinned(sright, pthread_kern->task_get_ipcspace(ctask));
+	} else {
+		th_thport = pthread_kern->ipc_port_copyout_send(sright, pthread_kern->task_get_ipcspace(ctask));
+	}
+	
 	if (!MACH_PORT_VALID(th_thport)) {
 		error = EMFILE; // userland will convert this into a crash
 		goto out;
@@ -478,11 +496,18 @@ _bsdthread_terminate(__unused struct proc *p,
 			kret = mach_vm_behavior_set(user_map, freeaddr, freesize, VM_BEHAVIOR_REUSABLE);
 #if MACH_ASSERT
 			if (kret != KERN_SUCCESS && kret != KERN_INVALID_ADDRESS) {
-				os_log_error(OS_LOG_DEFAULT, "unable to make thread stack reusable (kr: %d)", kret);
+				os_log_error(OS_LOG_DEFAULT, "unable to make main thread stack reusable (kr: %d)", kret);
 			}
 #endif
-			kret = kret ? kret : mach_vm_protect(user_map, freeaddr, freesize, FALSE, VM_PROT_NONE);
-			assert(kret == KERN_SUCCESS || kret == KERN_INVALID_ADDRESS);
+
+			if (kret == KERN_SUCCESS) {
+				kret = mach_vm_protect(user_map, freeaddr, freesize, FALSE, VM_PROT_NONE);
+#if MACH_ASSERT
+				if (kret != KERN_SUCCESS && kret != KERN_INVALID_ADDRESS) {
+					os_log_error(OS_LOG_DEFAULT, "unable to make main thread stack PROT_NONE (kr: %d)", kret);
+				}
+#endif
+			}
 		} else {
 			kret = mach_vm_deallocate(pthread_kern->current_map(), freeaddr, freesize);
 			if (kret != KERN_SUCCESS) {
@@ -494,7 +519,11 @@ _bsdthread_terminate(__unused struct proc *p,
 	if (pthread_kern->thread_will_park_or_terminate) {
 		pthread_kern->thread_will_park_or_terminate(th);
 	}
-	(void)thread_terminate(th);
+	if (pthread_kern->thread_terminate_pinned) {
+		(void)pthread_kern->thread_terminate_pinned(th);
+	} else {
+		(void)thread_terminate(th);
+	}
 	if (sem != MACH_PORT_NULL) {
 		kret = pthread_kern->semaphore_signal_internal_trap(sem);
 		if (kret != KERN_SUCCESS) {
@@ -600,6 +629,14 @@ _bsdthread_register(struct proc *p,
 				data.mach_thread_self_offset);
 	}
 
+	if (pthread_kern->proc_set_workqueue_quantum_offset) {
+		if (data.wq_quantum_expiry_offset > max_tsd_offset) {
+			data.wq_quantum_expiry_offset = 0;
+		}
+
+		pthread_kern->proc_set_workqueue_quantum_offset(p, data.wq_quantum_expiry_offset);
+	}
+
 	if (pthread_init_data != 0) {
 		/* Outgoing data that userspace expects as a reply */
 		data.version = sizeof(struct _pthread_registration_data);
@@ -642,6 +679,13 @@ _bsdthread_register(struct proc *p,
 
 	/* return the supported feature set as the return value. */
 	*retval = PTHREAD_FEATURE_SUPPORTED;
+
+#if _PTHREAD_CONFIG_JIT_WRITE_PROTECT
+	if (pthread_kern->proc_get_pthread_jit_allowlist &&
+			pthread_kern->proc_get_pthread_jit_allowlist(p)) {
+		*retval |= PTHREAD_FEATURE_JIT_ALLOWLIST;
+	}
+#endif // _PTHREAD_CONFIG_JIT_WRITE_PROTECT
 
 	return(0);
 }
