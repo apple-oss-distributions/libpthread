@@ -2,14 +2,14 @@
  * Copyright (c) 2007, 2012 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
  * compliance with the License. Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this
  * file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -17,7 +17,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_LICENSE_HEADER_END@
  */
 
@@ -57,6 +57,9 @@
 
 /* Legacy dispatch workqueue function flags */
 #define WORKQ_ADDTHREADS_OPTION_OVERCOMMIT 0x00000001
+
+/* Flags for _pthread_workloop_create function */
+#define PTHREAD_WORKLOOP_CREATE_WITH_BOUND_THREAD 0x00000001
 
 __BEGIN_DECLS
 
@@ -200,6 +203,10 @@ __API_AVAILABLE(macos(10.10.2))
 int
 _pthread_workqueue_asynchronous_override_reset_all_self(void);
 
+__API_AVAILABLE(macos(14.3), ios(17.4), tvos(17.4), watchos(10.4), xros(1.1), driverkit(23.4))
+int
+_pthread_workqueue_allow_send_signals(int signum);
+
 __API_AVAILABLE(macos(10.14), ios(12.0), tvos(12.0), watchos(5.0))
 int
 _pthread_workloop_create(uint64_t workloop_id, uint64_t options, pthread_attr_t *attr);
@@ -207,6 +214,7 @@ _pthread_workloop_create(uint64_t workloop_id, uint64_t options, pthread_attr_t 
 __API_AVAILABLE(macos(10.14), ios(12.0), tvos(12.0), watchos(5.0))
 int
 _pthread_workloop_destroy(uint64_t workloop_id);
+
 
 __END_DECLS
 
